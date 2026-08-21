@@ -1,0 +1,114 @@
+name: Build Scan and Push Container Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  IMAGE_REPOSITORY: cortex-cli-demo
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Image Name
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          set -e
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            echo "DOCKERHUB_USERNAME repository variable is not set."
+            exit 1
+          fi
+
+          IMAGE_NAME="${DOCKERHUB_USERNAME}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> "$GITHUB_ENV"
+          echo "Image to build and scan: ${IMAGE_NAME}"
+
+      - name: Build Docker Image
+        run: |
+          docker build --tag "$IMAGE_NAME" .
+
+      - name: Verify Docker Image
+        run: |
+          docker images
+          docker inspect "$IMAGE_NAME" > /dev/null
+          echo "Image found successfully: $IMAGE_NAME"
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhyperscan5 jq curl
+
+      - name: Install Cortex CLI
+        env:
+          CORTEX_URL: ${{ secrets.CORTEX_URL }}
+          API_ID: ${{ secrets.CORTEX_API_ID }}
+          API_KEY: ${{ secrets.CORTEX_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
+          echo "Detected architecture: $ARCH"
+
+          crtx_resp=$(curl --silent --show-error --fail             "$CORTEX_URL/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=$ARCH"             -H "x-xdr-auth-id: $API_ID"             -H "Authorization: $API_KEY")
+
+          if echo "$crtx_resp" | jq -e '.error_code' > /dev/null; then
+            echo "Failed to retrieve Cortex CLI download link."
+            exit 1
+          fi
+
+          crtx_url=$(echo "$crtx_resp" | jq -r '.signed_url')
+
+          if [ -z "$crtx_url" ] || [ "$crtx_url" = "null" ]; then
+            echo "ERROR: signed_url not found in Cortex API response."
+            exit 1
+          fi
+
+          curl --location --fail --show-error --output cortexcli "$crtx_url"
+          chmod +x cortexcli
+          sudo mv cortexcli /usr/local/bin/cortexcli
+          cortexcli --version
+
+      - name: Execute Cortex Image Scan
+        env:
+          CORTEX_URL: ${{ secrets.CORTEX_URL }}
+          API_ID: ${{ secrets.CORTEX_API_ID }}
+          API_KEY: ${{ secrets.CORTEX_API_KEY }}
+        run: |
+          set -e
+          docker images
+          docker inspect "$IMAGE_NAME" > /dev/null
+
+          sudo cortexcli             --log-level debug             --api-base-url "$CORTEX_URL"             --api-key "$API_KEY"             --api-key-id "$API_ID"             image scan             --timeout 600             "$IMAGE_NAME"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push Docker Image
+        run: |
+          docker push "$IMAGE_NAME"
+
+      - name: Tag Image as Latest
+        if: github.ref == 'refs/heads/main'
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+        run: |
+          LATEST_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_REPOSITORY}:latest"
+          docker tag "$IMAGE_NAME" "$LATEST_IMAGE"
+          echo "LATEST_IMAGE=$LATEST_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Push Latest Image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker push "$LATEST_IMAGE"
